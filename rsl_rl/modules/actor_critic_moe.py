@@ -14,7 +14,11 @@ from rsl_rl.networks import EmpiricalNormalization, MLP, Memory
 
 
 class MoeActorCriticRecurrent(nn.Module):
-    """Recurrent actor-critic with a shared-gating MoE head for actor and critic."""
+    """Recurrent actor-critic with shared LSTM backbone and MoE head for actor and critic.
+    
+    Architecture follows Algorithm 1 from the paper:
+    Obs -> Encoder -> Shared LSTM (h_t) -> Gating (Weights) & Experts (Outputs) -> Weighted Action/Value
+    """
 
     is_recurrent = True
 
@@ -32,6 +36,7 @@ class MoeActorCriticRecurrent(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
+        clip_min_std: float = 0.05,
         rnn_type="lstm",
         rnn_hidden_dim=256,
         rnn_num_layers=1,
@@ -66,20 +71,23 @@ class MoeActorCriticRecurrent(nn.Module):
         num_actor_obs = self._resolve_obs_dim(obs, obs_groups["policy"])
         num_critic_obs = self._resolve_obs_dim(obs, obs_groups["critic"])
 
-        # encoders (optional)
-        self.actor_encoder = self._build_encoder(num_actor_obs, encoder_hidden_dims, activation)
+        # encoder for policy obs (used for shared LSTM input)
+        self.encoder = self._build_encoder(num_actor_obs, encoder_hidden_dims, activation)
+        encoder_output_dim = self._encoder_output_dim(num_actor_obs, encoder_hidden_dims)
+        
+        # critic encoder for privileged observations (for value estimation)
         self.critic_encoder = self._build_encoder(num_critic_obs, encoder_hidden_dims, activation)
-        actor_rnn_input_dim = self._encoder_output_dim(num_actor_obs, encoder_hidden_dims)
-        critic_rnn_input_dim = self._encoder_output_dim(num_critic_obs, encoder_hidden_dims)
+        critic_encoder_output_dim = self._encoder_output_dim(num_critic_obs, encoder_hidden_dims)
 
-        # memory blocks
-        self.memory_a = Memory(actor_rnn_input_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(critic_rnn_input_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # Shared LSTM backbone (Algorithm 1: h_t <- LSTM([l_t, c_t]))
+        # Input: encoded policy obs + encoded critic obs (privileged info)
+        shared_rnn_input_dim = encoder_output_dim + critic_encoder_output_dim
+        self.memory = Memory(shared_rnn_input_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
-        # shared gating network
+        # shared gating network: g_hat <- softmax(g(h_t))
         self.gating = MLP(rnn_hidden_dim, num_experts, gating_hidden_dims, activation)
 
-        # experts
+        # experts: a_t <- sum(g_hat_i * f_i(h_t))
         self.actor_experts = nn.ModuleList(
             [MLP(rnn_hidden_dim, num_actions, actor_expert_hidden_dims, activation) for _ in range(num_experts)]
         )
@@ -93,16 +101,21 @@ class MoeActorCriticRecurrent(nn.Module):
         self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs) if actor_obs_normalization else nn.Identity()
         self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs) if critic_obs_normalization else nn.Identity()
 
-        print(f"Actor encoder: {self.actor_encoder}")
-        print(f"Actor memory: {self.memory_a}")
+        # store dimensions for inference mode
+        self._num_actor_obs = num_actor_obs
+        self._encoder_output_dim = encoder_output_dim
+        self._critic_encoder_output_dim = critic_encoder_output_dim
+
+        print(f"Encoder (policy): {self.encoder}")
+        print(f"Critic encoder (privileged): {self.critic_encoder}")
+        print(f"Shared memory (LSTM): {self.memory}")
         print(f"Shared gating: {self.gating}")
         print(f"Actor experts: {self.actor_experts}")
-        print(f"Critic encoder: {self.critic_encoder}")
-        print(f"Critic memory: {self.memory_c}")
         print(f"Critic experts: {self.critic_experts}")
 
         # action noise
         self.noise_std_type = noise_std_type
+        self.clip_min_std = clip_min_std  # Table IX: clip min std = 0.05
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
@@ -134,38 +147,99 @@ class MoeActorCriticRecurrent(nn.Module):
     """
 
     def reset(self, dones=None):
-        self.memory_a.reset(dones)
-        self.memory_c.reset(dones)
+        self.memory.reset(dones)
 
     def act(self, obs, masks=None, hidden_states=None):
+        """Forward pass for action sampling during rollout.
+        
+        Uses shared LSTM with concatenated policy obs and privileged obs as input.
+        """
+        # Encode policy observations
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        actor_obs = self.actor_encoder(actor_obs)
-        out_mem = self.memory_a(actor_obs, masks, hidden_states).squeeze(0)
-        self._update_distribution(out_mem)
+        encoded_actor = self.encoder(actor_obs)
+        
+        # Encode critic (privileged) observations
+        critic_obs = self.get_critic_obs(obs)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
+        encoded_critic = self.critic_encoder(critic_obs)
+        
+        # Concatenate for shared LSTM input: l_t = [z_t, e_t, p_t]
+        lstm_input = torch.cat([encoded_actor, encoded_critic], dim=-1)
+        
+        # Shared LSTM: h_t <- LSTM([l_t, c_t])
+        h_t = self.memory(lstm_input, masks, hidden_states)
+        
+        # Only squeeze if sequence length is 1 (rollout phase)
+        if h_t.shape[0] == 1:
+            h_t = h_t.squeeze(0)
+        
+        # Cache h_t for value estimation
+        self._cached_h_t = h_t
+        
+        self._update_distribution(h_t)
         return self.distribution.sample()
 
     def act_inference(self, obs):
+        """Forward pass for action inference.
+        
+        In Oracle Stage 1: use full privileged observations from simulator.
+        In Stage 2 (future): use estimator to predict privileged info.
+        """
+        # Encode policy observations
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        actor_obs = self.actor_encoder(actor_obs)
-        out_mem = self.memory_a(actor_obs).squeeze(0)
-        action_mean = self._moe_forward(out_mem, self.actor_experts)
+        encoded_actor = self.encoder(actor_obs)
+        
+        # Oracle Stage 1: get privileged observations from simulator (same as training)
+        critic_obs = self.get_critic_obs(obs)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
+        encoded_critic = self.critic_encoder(critic_obs)
+        
+        # Concatenate for shared LSTM input
+        lstm_input = torch.cat([encoded_actor, encoded_critic], dim=-1)
+        
+        # Shared LSTM
+        h_t = self.memory(lstm_input).squeeze(0)
+        
+        # MoE forward for action
+        action_mean = self._moe_forward(h_t, self.actor_experts)
         return action_mean
 
     def evaluate(self, obs, masks=None, hidden_states=None):
-        critic_obs = self.get_critic_obs(obs)
-        critic_obs = self.critic_obs_normalizer(critic_obs)
-        critic_obs = self.critic_encoder(critic_obs)
-        out_mem = self.memory_c(critic_obs, masks, hidden_states).squeeze(0)
-        values = self._moe_forward(out_mem, self.critic_experts)
+        """Evaluate value using cached h_t from act() or compute fresh.
+        
+        During rollout, reuse cached h_t for efficiency.
+        During learning, compute fresh with provided hidden states.
+        """
+        if hasattr(self, '_cached_h_t') and masks is None and hidden_states is None:
+            # Reuse cached h_t from act() during rollout
+            h_t = self._cached_h_t
+        else:
+            # Compute fresh during learning phase
+            actor_obs = self.get_actor_obs(obs)
+            actor_obs = self.actor_obs_normalizer(actor_obs)
+            encoded_actor = self.encoder(actor_obs)
+            
+            critic_obs = self.get_critic_obs(obs)
+            critic_obs = self.critic_obs_normalizer(critic_obs)
+            encoded_critic = self.critic_encoder(critic_obs)
+            
+            lstm_input = torch.cat([encoded_actor, encoded_critic], dim=-1)
+            h_t = self.memory(lstm_input, masks, hidden_states)
+            
+            if h_t.shape[0] == 1:
+                h_t = h_t.squeeze(0)
+        
+        values = self._moe_forward(h_t, self.critic_experts)
         return values
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def get_hidden_states(self):
-        return self.memory_a.hidden_states, self.memory_c.hidden_states
+        # Return shared memory hidden states (duplicated for compatibility)
+        return self.memory.hidden_states, self.memory.hidden_states
 
     def update_normalization(self, obs):
         if self.actor_obs_normalization:
@@ -214,9 +288,10 @@ class MoeActorCriticRecurrent(nn.Module):
         return hidden_dims[-1]
 
     def _moe_forward(self, features: torch.Tensor, experts: nn.ModuleList) -> torch.Tensor:
+        # Use dim=-2 to ensure compatibility with both 2D (num_envs, hidden) and 3D (seq_len, batch, hidden) inputs
         weights = torch.softmax(self.gating(features), dim=-1)
-        expert_outputs = torch.stack([expert(features) for expert in experts], dim=1)
-        mixed_output = torch.sum(weights.unsqueeze(-1) * expert_outputs, dim=1)
+        expert_outputs = torch.stack([expert(features) for expert in experts], dim=-2)
+        mixed_output = torch.sum(weights.unsqueeze(-1) * expert_outputs, dim=-2)
         return mixed_output
 
     def _update_distribution(self, features):
@@ -227,4 +302,6 @@ class MoeActorCriticRecurrent(nn.Module):
             std = torch.exp(self.log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        # Clip minimum standard deviation (Table IX: clip_min_std = 0.05)
+        std = torch.clamp(std, min=self.clip_min_std)
         self.distribution = Normal(mean, std)
